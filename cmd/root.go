@@ -25,6 +25,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -55,29 +57,26 @@ var rootCmd = &cobra.Command{
 			return fmt.Errorf("no relay 'to' specified")
 		}
 
-		duration, err := cmd.Flags().GetDuration("duration")
-		if err != nil {
-			return err
-		}
-		if duration == 0 {
-			return fmt.Errorf("no 'duration' specified")
-		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-		sub, cancel := getSubscription(froms[0], duration)
-
-		evs := make([]nostr.Event, 0)
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 		go func() {
-			<-sub.EndOfStoredEvents
+			<-signals
 			cancel()
 		}()
-		for ev := range sub.Events {
-			evs = append(evs, *ev)
-		}
 
-		for _, ev := range evs {
-			publish(tos, ev)
+		sub := getSubscription(ctx, froms[0])
+
+		for {
+			select {
+			case ev := <-sub.Events:
+				publish(tos, *ev)
+			case <-ctx.Done():
+				return nil
+			}
 		}
-		return nil
 	},
 }
 
@@ -88,41 +87,36 @@ func Execute() {
 	}
 }
 
-func getSubscription(from string, duration time.Duration) (*nostr.Subscription, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-
+func getSubscription(ctx context.Context, from string) *nostr.Subscription {
 	relay, err := nostr.RelayConnect(ctx, from)
 	if err != nil {
 		panic(err)
 	}
 
 	var filters nostr.Filters
-	t := make(map[string][]string)
-	since := nostr.Timestamp(time.Now().Add(-duration).Unix())
-	until := nostr.Timestamp(time.Now().Unix())
+	since := nostr.Timestamp(time.Now().Unix())
 	filters = []nostr.Filter{{
-		Kinds: []int{nostr.KindTextNote},
-		Tags:  t,
 		Since: &since,
-		Until: &until,
 	}}
 
 	sub, err := relay.Subscribe(ctx, filters)
 	if err != nil {
 		fmt.Println(err)
 	}
-	return sub, cancel
+	return sub
 }
 
 func publish(tos []string, ev nostr.Event) {
-	for _, url := range tos {
-		ctx := context.WithValue(context.Background(), "url", url)
-		relay, e := nostr.RelayConnect(ctx, url)
+	type relayurl string
+	fmt.Printf("%+v\n", ev)
+	for _, to := range tos {
+		ctx := context.WithValue(context.Background(), relayurl("relay"), to)
+		relay, e := nostr.RelayConnect(ctx, to)
 		if e != nil {
 			fmt.Println(e)
 			continue
 		}
-		fmt.Println("posting to: ", url)
+		fmt.Println("posting to: ", to)
 		relay.Publish(ctx, ev)
 	}
 }
@@ -130,5 +124,4 @@ func publish(tos []string, ev nostr.Event) {
 func init() {
 	rootCmd.Flags().StringArrayP("from", "f", []string{}, "relay to crawl")
 	rootCmd.Flags().StringArrayP("to", "t", []string{}, "relay to publish")
-	rootCmd.Flags().DurationP("duration", "d", 0, "duration to crawl")
 }
